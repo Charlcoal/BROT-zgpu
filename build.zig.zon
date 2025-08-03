@@ -5,7 +5,7 @@
     .version = "0.0.0",
 
     .fingerprint = 0xd83bbde73cc10481, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.14.1",
 
     .dependencies = .{
         .system_sdk = .{

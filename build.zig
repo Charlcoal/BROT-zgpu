@@ -13,7 +13,6 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "BROT",
         .root_module = exe_mod,
-        .use_lld = false, // TEMP FIX
     });
 
     const zglfw = b.dependency("zglfw", .{
