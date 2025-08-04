@@ -55,7 +55,7 @@ pub fn main() !void {
     defer zgui.deinit();
 
     _ = zgui.io.addFontFromFile(
-        content_dir ++ "Roboto-Medium.ttf",
+        content_dir ++ "fonts/Roboto-Medium.ttf",
         std.math.floor(16.0 * scale_factor),
     );
 
