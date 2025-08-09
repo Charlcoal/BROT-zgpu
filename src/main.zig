@@ -29,7 +29,7 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    const graphics_context = try zgpu.GraphicsContext.create(
+    const gctx = try zgpu.GraphicsContext.create(
         gpa,
         .{
             .window = window,
@@ -44,7 +44,9 @@ pub fn main() !void {
         },
         .{},
     );
-    defer graphics_context.destroy(gpa);
+    defer gctx.destroy(gpa);
+
+    // ------------ gui -------------
 
     const scale_factor = scale_factor: {
         const scale = window.getContentScale();
@@ -61,7 +63,7 @@ pub fn main() !void {
 
     zgui.backend.init(
         window,
-        graphics_context.device,
+        gctx.device,
         @intFromEnum(zgpu.GraphicsContext.swapchain_format),
         @intFromEnum(wgpu.TextureFormat.undef),
     );
@@ -69,12 +71,89 @@ pub fn main() !void {
 
     zgui.getStyle().scaleAllSizes(scale_factor);
 
+    // ----------- end gui -----------
+
+    // ----------- fractal pipeline ------------
+
+    var shader_file: std.fs.File = try std.fs.cwd().openFile(content_dir ++ "shaders/test.wgsl", .{});
+    const shader_code = try shader_file.readToEndAllocOptions(gpa, 16_384, null, 4, 0);
+
+    const shader_code_desc: wgpu.ShaderModuleWGSLDescriptor = .{
+        .chain = .{
+            .next = null,
+            .struct_type = .shader_module_wgsl_descriptor,
+        },
+        .code = shader_code,
+    };
+    const shader_desc: wgpu.ShaderModuleDescriptor = .{
+        .next_in_chain = @ptrCast(&shader_code_desc),
+    };
+    const shader_module: wgpu.ShaderModule = gctx.device.createShaderModule(shader_desc);
+
+    const blend_state: wgpu.BlendState = .{
+        .color = .{
+            .src_factor = .src_alpha,
+            .dst_factor = .one_minus_src_alpha,
+            .operation = .add,
+        },
+        .alpha = .{
+            .src_factor = .zero,
+            .dst_factor = .one,
+            .operation = .add,
+        },
+    };
+    const color_target: wgpu.ColorTargetState = .{
+        .format = gctx.swapchain_descriptor.format,
+        .write_mask = .all,
+        .blend = &blend_state,
+    };
+
+    const pipeline_info: wgpu.RenderPipelineDescriptor = .{
+        .vertex = .{
+            .buffer_count = 0,
+            .buffers = null,
+            .module = shader_module,
+            .entry_point = "vs_main",
+            .constant_count = 0,
+            .constants = null,
+        },
+        .primitive = .{
+            .topology = .triangle_list,
+            .strip_index_format = .undef,
+            .front_face = .ccw,
+            .cull_mode = .none,
+        },
+        .fragment = &.{
+            .module = shader_module,
+            .entry_point = "fs_main",
+            .constant_count = 0,
+            .constants = null,
+            .target_count = 1,
+            .targets = @ptrCast(&color_target),
+        },
+        .depth_stencil = null,
+        .layout = null,
+        .multisample = .{
+            .count = 1,
+            .mask = ~@as(u32, 0),
+            .alpha_to_coverage_enabled = false,
+        },
+    };
+
+    const fractal_pipeline: wgpu.RenderPipeline = gctx.device.createRenderPipeline(pipeline_info);
+    defer fractal_pipeline.release();
+
+    gpa.free(shader_code);
+    shader_module.release();
+    // ----------------- end fractal pipeline --------------------
+
+    // ----------------- main loop ----------------------------------
     while (!window.shouldClose() and window.getKey(.escape) != .press) {
         zglfw.pollEvents();
 
         zgui.backend.newFrame(
-            graphics_context.swapchain_descriptor.width,
-            graphics_context.swapchain_descriptor.height,
+            gctx.swapchain_descriptor.width,
+            gctx.swapchain_descriptor.height,
         );
 
         // Set the starting window position and size to custom values
@@ -88,12 +167,20 @@ pub fn main() !void {
         }
         zgui.end();
 
-        const swapchain_texv = graphics_context.swapchain.getCurrentTextureView();
+        const swapchain_texv = gctx.swapchain.getCurrentTextureView();
         defer swapchain_texv.release();
 
         const commands = commands: {
-            const encoder = graphics_context.device.createCommandEncoder(null);
+            const encoder = gctx.device.createCommandEncoder(null);
             defer encoder.release();
+
+            // fractal pass
+            {
+                const pass = zgpu.beginRenderPassSimple(encoder, .load, swapchain_texv, null, null, null);
+                defer zgpu.endReleasePass(pass);
+                pass.setPipeline(fractal_pipeline);
+                pass.draw(3, 1, 0, 0);
+            }
 
             // GUI pass
             {
@@ -106,7 +193,7 @@ pub fn main() !void {
         };
         defer commands.release();
 
-        graphics_context.submit(&.{commands});
-        _ = graphics_context.present();
+        gctx.submit(&.{commands});
+        _ = gctx.present();
     }
 }
