@@ -179,7 +179,7 @@ pub fn main() !void {
                 const pass = zgpu.beginRenderPassSimple(encoder, .load, swapchain_texv, null, null, null);
                 defer zgpu.endReleasePass(pass);
                 pass.setPipeline(fractal_pipeline);
-                pass.draw(3, 1, 0, 0);
+                pass.draw(6, 1, 0, 0);
             }
 
             // GUI pass
