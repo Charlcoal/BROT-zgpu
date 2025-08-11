@@ -1,7 +1,17 @@
+struct FracFrame {
+    center: vec2f,
+    resolution: vec2f,
+    height_scale: f32,
+}
+
+@group(0) @binding(0) var<uniform> frame: FracFrame;
+
 @vertex
 fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) vec4f {
-    const verts = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(-1.0, 1.0), vec2f(1.0, 1.0),
-                   vec2f(1.0, 1.0), vec2f(-1.0, -1.0), vec2f(1.0, -1.0));
+    const verts = array<vec2f, 6>(
+        vec2f(-1.0, -1.0), vec2f(-1.0,  1.0), vec2f(1.0,  1.0),
+        vec2f( 1.0,  1.0), vec2f(-1.0, -1.0), vec2f(1.0, -1.0)
+    );
     var p = verts[in_vertex_index];
     return vec4f(p, 0.0, 1.0);
 }
@@ -11,7 +21,12 @@ fn fs_main(@builtin(position) screen_pos: vec4f) -> @location(0) vec4f {
     const max_count: u32 = 5000;
 	const escape_radius: f32 = 1e8;
 	const interior_test_e_sqr: f32 = 1e-6;
-    let c: vec2f = screen_pos.xy / vec2f(200) - vec2f(2);
+
+    var c: vec2f = 2.0 * screen_pos.xy / frame.resolution;
+    c -= vec2f(1); // coords match vert shader
+    c *= frame.height_scale;
+    c.x *= frame.resolution.x / frame.resolution.y;
+    c += frame.center;
     var pos: vec2f = c;
 
     var count: u32 = 1;

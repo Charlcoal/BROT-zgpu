@@ -29,6 +29,12 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
+    const required_limits: wgpu.RequiredLimits = .{ .limits = .{
+        .max_bind_groups = 1,
+        .max_uniform_buffers_per_shader_stage = 1,
+        .max_uniform_buffer_binding_size = 16 * 4,
+    } };
+
     const gctx = try zgpu.GraphicsContext.create(
         gpa,
         .{
@@ -42,7 +48,7 @@ pub fn main() !void {
             .fn_getWaylandSurface = @ptrCast(&zglfw.getWaylandWindow),
             .fn_getCocoaWindow = @ptrCast(&zglfw.getCocoaWindow),
         },
-        .{},
+        .{ .required_limits = &required_limits },
     );
     defer gctx.destroy(gpa);
 
@@ -74,6 +80,63 @@ pub fn main() !void {
     // ----------- end gui -----------
 
     // ----------- fractal pipeline ------------
+
+    const FractalFrame = struct {
+        center: @Vector(2, f32),
+        resolution: @Vector(2, f32),
+        height_scale: f32,
+    };
+
+    const uniform_buffer_desc: wgpu.BufferDescriptor = .{
+        .size = @sizeOf(FractalFrame),
+        .usage = .{ .copy_dst = true, .uniform = true },
+        .mapped_at_creation = .false,
+    };
+    var uniform_buffer: wgpu.Buffer = gctx.device.createBuffer(uniform_buffer_desc);
+    defer uniform_buffer.release();
+
+    var fractal_frame: FractalFrame = .{
+        .center = .{ 0, 0 },
+        .resolution = .{ @floatFromInt(gctx.swapchain_descriptor.width), @floatFromInt(gctx.swapchain_descriptor.height) },
+        .height_scale = 1,
+    };
+
+    gctx.device.getQueue().writeBuffer(uniform_buffer, 0, FractalFrame, (&fractal_frame)[0..1]);
+
+    const binding_layout: wgpu.BindGroupLayoutEntry = .{
+        .binding = 0,
+        .visibility = .{ .fragment = true },
+        .buffer = .{ .binding_type = .uniform, .min_binding_size = @sizeOf(FractalFrame) },
+    };
+
+    const bind_group_layout_desc: wgpu.BindGroupLayoutDescriptor = .{
+        .entry_count = 1,
+        .entries = @ptrCast(&binding_layout),
+    };
+    var bind_group_layout = gctx.device.createBindGroupLayout(bind_group_layout_desc);
+    defer bind_group_layout.release();
+
+    const binding: wgpu.BindGroupEntry = .{
+        .binding = 0,
+        .buffer = uniform_buffer,
+        .offset = 0,
+        .size = @sizeOf(FractalFrame),
+    };
+
+    const bind_group_desc: wgpu.BindGroupDescriptor = .{
+        .layout = bind_group_layout,
+        .entry_count = 1,
+        .entries = @ptrCast(&binding),
+    };
+    var bind_group = gctx.device.createBindGroup(bind_group_desc);
+    defer bind_group.release();
+
+    const pipeline_layout_desc: wgpu.PipelineLayoutDescriptor = .{
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&bind_group_layout),
+    };
+    var pipeline_layout = gctx.device.createPipelineLayout(pipeline_layout_desc);
+    defer pipeline_layout.release();
 
     var shader_file: std.fs.File = try std.fs.cwd().openFile(content_dir ++ "shaders/test.wgsl", .{});
     const shader_code = try shader_file.readToEndAllocOptions(gpa, 16_384, null, 4, 0);
@@ -132,7 +195,7 @@ pub fn main() !void {
             .targets = @ptrCast(&color_target),
         },
         .depth_stencil = null,
-        .layout = null,
+        .layout = pipeline_layout,
         .multisample = .{
             .count = 1,
             .mask = ~@as(u32, 0),
@@ -150,6 +213,9 @@ pub fn main() !void {
     // ----------------- main loop ----------------------------------
     while (!window.shouldClose() and window.getKey(.escape) != .press) {
         zglfw.pollEvents();
+
+        fractal_frame.resolution = .{ @floatFromInt(gctx.swapchain_descriptor.width), @floatFromInt(gctx.swapchain_descriptor.height) };
+        gctx.device.getQueue().writeBuffer(uniform_buffer, 0, FractalFrame, (&fractal_frame)[0..1]);
 
         zgui.backend.newFrame(
             gctx.swapchain_descriptor.width,
@@ -179,6 +245,7 @@ pub fn main() !void {
                 const pass = zgpu.beginRenderPassSimple(encoder, .load, swapchain_texv, null, null, null);
                 defer zgpu.endReleasePass(pass);
                 pass.setPipeline(fractal_pipeline);
+                pass.setBindGroup(0, bind_group, null);
                 pass.draw(6, 1, 0, 0);
             }
 
