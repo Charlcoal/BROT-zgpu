@@ -8,6 +8,16 @@ const zgui = @import("zgui");
 const content_dir = @import("build_options").content_dir;
 const window_title = "BROT";
 
+const FractalFrame = struct {
+    center: @Vector(2, f32),
+    resolution: @Vector(2, f32),
+    height_scale: f32,
+};
+
+const GLFWRefs = struct {
+    frame: *FractalFrame,
+};
+
 pub fn main() !void {
     try zglfw.init();
     defer zglfw.terminate();
@@ -24,6 +34,10 @@ pub fn main() !void {
     const window = try zglfw.Window.create(800, 500, window_title, null);
     defer window.destroy();
     window.setSizeLimits(400, 400, -1, -1);
+
+    var glfw_refs: GLFWRefs = undefined;
+    window.setUserPointer(&glfw_refs);
+    _ = window.setScrollCallback(scrollCallback);
 
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_state.deinit();
@@ -78,68 +92,119 @@ pub fn main() !void {
     zgui.getStyle().scaleAllSizes(scale_factor);
 
     // ----------- end gui -----------
-
-    // ----------- fractal pipeline ------------
-
-    const FractalFrame = struct {
-        center: @Vector(2, f32),
-        resolution: @Vector(2, f32),
-        height_scale: f32,
-    };
-
-    const uniform_buffer_desc: wgpu.BufferDescriptor = .{
-        .size = @sizeOf(FractalFrame),
-        .usage = .{ .copy_dst = true, .uniform = true },
-        .mapped_at_creation = .false,
-    };
-    var uniform_buffer: wgpu.Buffer = gctx.device.createBuffer(uniform_buffer_desc);
-    defer uniform_buffer.release();
-
     var fractal_frame: FractalFrame = .{
         .center = .{ 0, 0 },
         .resolution = .{ @floatFromInt(gctx.swapchain_descriptor.width), @floatFromInt(gctx.swapchain_descriptor.height) },
         .height_scale = 1,
     };
+    glfw_refs.frame = &fractal_frame;
+
+    const fractal_uniform_group = createFractalUniformGroup(gctx);
+    var uniform_buffer = fractal_uniform_group.uniform_buffer;
+    var bind_group_layout = fractal_uniform_group.bind_group_layout;
+    var bind_group = fractal_uniform_group.bind_group;
+    defer uniform_buffer.release();
+    defer bind_group_layout.release();
+    defer bind_group.release();
 
     gctx.device.getQueue().writeBuffer(uniform_buffer, 0, FractalFrame, (&fractal_frame)[0..1]);
 
-    const binding_layout: wgpu.BindGroupLayoutEntry = .{
-        .binding = 0,
-        .visibility = .{ .fragment = true },
-        .buffer = .{ .binding_type = .uniform, .min_binding_size = @sizeOf(FractalFrame) },
-    };
+    const fractal_pipeline = try createFractalPipeline(gctx, gpa, (&bind_group_layout)[0..1]);
+    defer fractal_pipeline.release();
 
-    const bind_group_layout_desc: wgpu.BindGroupLayoutDescriptor = .{
-        .entry_count = 1,
-        .entries = @ptrCast(&binding_layout),
-    };
-    var bind_group_layout = gctx.device.createBindGroupLayout(bind_group_layout_desc);
-    defer bind_group_layout.release();
+    // ----------------- main loop ----------------------------------
+    while (!window.shouldClose() and window.getKey(.escape) != .press) {
+        zglfw.pollEvents();
 
-    const binding: wgpu.BindGroupEntry = .{
-        .binding = 0,
-        .buffer = uniform_buffer,
-        .offset = 0,
-        .size = @sizeOf(FractalFrame),
-    };
+        fractal_frame.resolution = .{ @floatFromInt(gctx.swapchain_descriptor.width), @floatFromInt(gctx.swapchain_descriptor.height) };
+        gctx.device.getQueue().writeBuffer(uniform_buffer, 0, FractalFrame, (&fractal_frame)[0..1]);
 
-    const bind_group_desc: wgpu.BindGroupDescriptor = .{
-        .layout = bind_group_layout,
-        .entry_count = 1,
-        .entries = @ptrCast(&binding),
-    };
-    var bind_group = gctx.device.createBindGroup(bind_group_desc);
-    defer bind_group.release();
+        zgui.backend.newFrame(
+            gctx.swapchain_descriptor.width,
+            gctx.swapchain_descriptor.height,
+        );
 
+        // Set the starting window position and size to custom values
+        zgui.setNextWindowPos(.{ .x = 20.0, .y = 20.0, .cond = .first_use_ever });
+        zgui.setNextWindowSize(.{ .w = -1.0, .h = -1.0, .cond = .first_use_ever });
+
+        if (zgui.begin("My window", .{})) {
+            if (zgui.button("Press me!", .{ .w = 200.0 })) {
+                std.debug.print("Button pressed\n", .{});
+            }
+        }
+        zgui.end();
+
+        const swapchain_texv = gctx.swapchain.getCurrentTextureView();
+        defer swapchain_texv.release();
+
+        const commands = commands: {
+            const encoder = gctx.device.createCommandEncoder(null);
+            defer encoder.release();
+
+            // fractal pass
+            {
+                const pass = zgpu.beginRenderPassSimple(encoder, .load, swapchain_texv, null, null, null);
+                defer zgpu.endReleasePass(pass);
+                pass.setPipeline(fractal_pipeline);
+                pass.setBindGroup(0, bind_group, null);
+                pass.draw(6, 1, 0, 0);
+            }
+
+            // GUI pass
+            {
+                const pass = zgpu.beginRenderPassSimple(encoder, .load, swapchain_texv, null, null, null);
+                defer zgpu.endReleasePass(pass);
+                zgui.backend.draw(pass);
+            }
+
+            break :commands encoder.finish(null);
+        };
+        defer commands.release();
+
+        gctx.submit(&.{commands});
+        _ = gctx.present();
+    }
+}
+
+fn scrollCallback(
+    window: *zglfw.Window,
+    xoffset: f64,
+    yoffset: f64,
+) callconv(.c) void {
+    const refs = window.getUserPointer(GLFWRefs);
+    _ = xoffset;
+    const scroll_factor: f32 = @floatCast(@exp(0.3 * yoffset));
+    var frame = refs.?.frame;
+
+    var mouse_pos_x: f64 = undefined;
+    var mouse_pos_y: f64 = undefined;
+    zglfw.getCursorPos(window, &mouse_pos_x, &mouse_pos_y);
+
+    // change mouse_pos to Vulkan coords
+    mouse_pos_x = 2.0 * mouse_pos_x / @as(f64, frame.resolution[0]) - 1.0;
+    mouse_pos_y = 2.0 * mouse_pos_y / @as(f64, frame.resolution[1]) - 1.0;
+
+    // change mouse_pos to mandelbrot coords
+    mouse_pos_x = mouse_pos_x * frame.height_scale * frame.resolution[0] / frame.resolution[1];
+    mouse_pos_y = mouse_pos_y * frame.height_scale;
+
+    frame.center[0] += @as(f32, @floatCast((1.0 - scroll_factor) * mouse_pos_x));
+    frame.center[1] += @as(f32, @floatCast((1.0 - scroll_factor) * mouse_pos_y));
+
+    frame.height_scale *= scroll_factor;
+}
+
+fn createFractalPipeline(gctx: *const zgpu.GraphicsContext, alloc: std.mem.Allocator, bind_group_layouts: []const wgpu.BindGroupLayout) !wgpu.RenderPipeline {
     const pipeline_layout_desc: wgpu.PipelineLayoutDescriptor = .{
-        .bind_group_layout_count = 1,
-        .bind_group_layouts = @ptrCast(&bind_group_layout),
+        .bind_group_layout_count = bind_group_layouts.len,
+        .bind_group_layouts = bind_group_layouts.ptr,
     };
     var pipeline_layout = gctx.device.createPipelineLayout(pipeline_layout_desc);
     defer pipeline_layout.release();
 
     var shader_file: std.fs.File = try std.fs.cwd().openFile(content_dir ++ "shaders/test.wgsl", .{});
-    const shader_code = try shader_file.readToEndAllocOptions(gpa, 16_384, null, 4, 0);
+    const shader_code = try shader_file.readToEndAllocOptions(alloc, 16_384, null, 4, 0);
 
     const shader_code_desc: wgpu.ShaderModuleWGSLDescriptor = .{
         .chain = .{
@@ -204,63 +269,52 @@ pub fn main() !void {
     };
 
     const fractal_pipeline: wgpu.RenderPipeline = gctx.device.createRenderPipeline(pipeline_info);
-    defer fractal_pipeline.release();
 
-    gpa.free(shader_code);
+    alloc.free(shader_code);
     shader_module.release();
-    // ----------------- end fractal pipeline --------------------
 
-    // ----------------- main loop ----------------------------------
-    while (!window.shouldClose() and window.getKey(.escape) != .press) {
-        zglfw.pollEvents();
+    return fractal_pipeline;
+}
 
-        fractal_frame.resolution = .{ @floatFromInt(gctx.swapchain_descriptor.width), @floatFromInt(gctx.swapchain_descriptor.height) };
-        gctx.device.getQueue().writeBuffer(uniform_buffer, 0, FractalFrame, (&fractal_frame)[0..1]);
+fn createFractalUniformGroup(gctx: *const zgpu.GraphicsContext) struct {
+    uniform_buffer: wgpu.Buffer,
+    bind_group_layout: wgpu.BindGroupLayout,
+    bind_group: wgpu.BindGroup,
+} {
+    const uniform_buffer_desc: wgpu.BufferDescriptor = .{
+        .size = @sizeOf(FractalFrame),
+        .usage = .{ .copy_dst = true, .uniform = true },
+        .mapped_at_creation = .false,
+    };
+    const uniform_buffer: wgpu.Buffer = gctx.device.createBuffer(uniform_buffer_desc);
 
-        zgui.backend.newFrame(
-            gctx.swapchain_descriptor.width,
-            gctx.swapchain_descriptor.height,
-        );
+    const binding_layout: wgpu.BindGroupLayoutEntry = .{
+        .binding = 0,
+        .visibility = .{ .fragment = true },
+        .buffer = .{ .binding_type = .uniform, .min_binding_size = @sizeOf(FractalFrame) },
+    };
+    const bind_group_layout_desc: wgpu.BindGroupLayoutDescriptor = .{
+        .entry_count = 1,
+        .entries = @ptrCast(&binding_layout),
+    };
+    const bind_group_layout = gctx.device.createBindGroupLayout(bind_group_layout_desc);
 
-        // Set the starting window position and size to custom values
-        zgui.setNextWindowPos(.{ .x = 20.0, .y = 20.0, .cond = .first_use_ever });
-        zgui.setNextWindowSize(.{ .w = -1.0, .h = -1.0, .cond = .first_use_ever });
+    const binding: wgpu.BindGroupEntry = .{
+        .binding = 0,
+        .buffer = uniform_buffer,
+        .offset = 0,
+        .size = @sizeOf(FractalFrame),
+    };
+    const bind_group_desc: wgpu.BindGroupDescriptor = .{
+        .layout = bind_group_layout,
+        .entry_count = 1,
+        .entries = @ptrCast(&binding),
+    };
+    const bind_group = gctx.device.createBindGroup(bind_group_desc);
 
-        if (zgui.begin("My window", .{})) {
-            if (zgui.button("Press me!", .{ .w = 200.0 })) {
-                std.debug.print("Button pressed\n", .{});
-            }
-        }
-        zgui.end();
-
-        const swapchain_texv = gctx.swapchain.getCurrentTextureView();
-        defer swapchain_texv.release();
-
-        const commands = commands: {
-            const encoder = gctx.device.createCommandEncoder(null);
-            defer encoder.release();
-
-            // fractal pass
-            {
-                const pass = zgpu.beginRenderPassSimple(encoder, .load, swapchain_texv, null, null, null);
-                defer zgpu.endReleasePass(pass);
-                pass.setPipeline(fractal_pipeline);
-                pass.setBindGroup(0, bind_group, null);
-                pass.draw(6, 1, 0, 0);
-            }
-
-            // GUI pass
-            {
-                const pass = zgpu.beginRenderPassSimple(encoder, .load, swapchain_texv, null, null, null);
-                defer zgpu.endReleasePass(pass);
-                zgui.backend.draw(pass);
-            }
-
-            break :commands encoder.finish(null);
-        };
-        defer commands.release();
-
-        gctx.submit(&.{commands});
-        _ = gctx.present();
-    }
+    return .{
+        .uniform_buffer = uniform_buffer,
+        .bind_group_layout = bind_group_layout,
+        .bind_group = bind_group,
+    };
 }
