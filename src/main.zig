@@ -47,6 +47,7 @@ pub fn main() !void {
         .max_bind_groups = 1,
         .max_uniform_buffers_per_shader_stage = 1,
         .max_uniform_buffer_binding_size = 16 * 4,
+        .max_sampled_textures_per_shader_stage = 1,
     } };
 
     const gctx = try zgpu.GraphicsContext.create(
@@ -92,6 +93,70 @@ pub fn main() !void {
     zgui.getStyle().scaleAllSizes(scale_factor);
 
     // ----------- end gui -----------
+
+    // ----------------- texture -----------------------
+    const texture_desc: wgpu.TextureDescriptor = .{
+        .dimension = .tdim_2d,
+        .format = .rgba8_unorm,
+        .mip_level_count = 1,
+        .sample_count = 1,
+        .size = .{ .width = 256, .height = 256, .depth_or_array_layers = 1 },
+        .usage = .{ .texture_binding = true, .copy_dst = true },
+        .view_format_count = 0,
+        .view_formats = null,
+    };
+
+    const texture: wgpu.Texture = gctx.device.createTexture(texture_desc);
+    defer texture.destroy();
+    defer texture.release();
+
+    // configure test gradient
+
+    var pixels = try gpa.alloc(u8, 4 * texture_desc.size.width * texture_desc.size.height);
+    defer gpa.free(pixels);
+    for (0..texture_desc.size.width) |i| {
+        for (0..texture_desc.size.height) |j| {
+            const index = 4 * (j * texture_desc.size.width + i);
+            const p: []u8 = pixels[index .. index + 4];
+            p[0] = @truncate(i);
+            p[1] = @truncate(j);
+            p[2] = 128;
+            p[3] = 255;
+        }
+    }
+
+    // upload data
+
+    const destination: wgpu.ImageCopyTexture = .{
+        .texture = texture,
+        .mip_level = 0,
+        .origin = .{ .x = 0, .y = 0, .z = 0 },
+        .aspect = .all,
+    };
+    const source: wgpu.TextureDataLayout = .{
+        .offset = 0,
+        .bytes_per_row = 4 * texture_desc.size.width,
+        .rows_per_image = texture_desc.size.height,
+    };
+
+    gctx.queue.writeTexture(destination, source, texture_desc.size, u8, pixels);
+
+    // texture view
+
+    const texture_view_desc: wgpu.TextureViewDescriptor = .{
+        .aspect = .all,
+        .base_array_layer = 0,
+        .array_layer_count = 1,
+        .base_mip_level = 0,
+        .mip_level_count = 1,
+        .dimension = .tvdim_2d,
+        .format = texture_desc.format,
+    };
+
+    const texture_view = texture.createView(texture_view_desc);
+
+    // -------------- end textrue ------------------------
+
     var fractal_frame: FractalFrame = .{
         .center = .{ 0, 0 },
         .resolution = .{ @floatFromInt(gctx.swapchain_descriptor.width), @floatFromInt(gctx.swapchain_descriptor.height) },
@@ -99,11 +164,17 @@ pub fn main() !void {
     };
     glfw_refs.frame = &fractal_frame;
 
-    const fractal_uniform_group = createFractalUniformGroup(gctx);
-    var uniform_buffer = fractal_uniform_group.uniform_buffer;
+    const uniform_buffer_desc: wgpu.BufferDescriptor = .{
+        .size = @sizeOf(FractalFrame),
+        .usage = .{ .copy_dst = true, .uniform = true },
+        .mapped_at_creation = .false,
+    };
+    const uniform_buffer: wgpu.Buffer = gctx.device.createBuffer(uniform_buffer_desc);
+    defer uniform_buffer.release();
+
+    const fractal_uniform_group = createBindGroupAndLayout(gctx, uniform_buffer, texture_view);
     var bind_group_layout = fractal_uniform_group.bind_group_layout;
     var bind_group = fractal_uniform_group.bind_group;
-    defer uniform_buffer.release();
     defer bind_group_layout.release();
     defer bind_group.release();
 
@@ -253,7 +324,7 @@ fn createFractalPipeline(gctx: *const zgpu.GraphicsContext, alloc: std.mem.Alloc
         },
         .fragment = &.{
             .module = shader_module,
-            .entry_point = "fs_main",
+            .entry_point = "texture_passthrough",
             .constant_count = 0,
             .constants = null,
             .target_count = 1,
@@ -276,44 +347,44 @@ fn createFractalPipeline(gctx: *const zgpu.GraphicsContext, alloc: std.mem.Alloc
     return fractal_pipeline;
 }
 
-fn createFractalUniformGroup(gctx: *const zgpu.GraphicsContext) struct {
-    uniform_buffer: wgpu.Buffer,
+fn createBindGroupAndLayout(gctx: *const zgpu.GraphicsContext, uniform_buffer: wgpu.Buffer, texture_view: wgpu.TextureView) struct {
     bind_group_layout: wgpu.BindGroupLayout,
     bind_group: wgpu.BindGroup,
 } {
-    const uniform_buffer_desc: wgpu.BufferDescriptor = .{
-        .size = @sizeOf(FractalFrame),
-        .usage = .{ .copy_dst = true, .uniform = true },
-        .mapped_at_creation = .false,
-    };
-    const uniform_buffer: wgpu.Buffer = gctx.device.createBuffer(uniform_buffer_desc);
-
-    const binding_layout: wgpu.BindGroupLayoutEntry = .{
+    const binding_layout: [2]wgpu.BindGroupLayoutEntry = .{ .{
         .binding = 0,
         .visibility = .{ .fragment = true },
         .buffer = .{ .binding_type = .uniform, .min_binding_size = @sizeOf(FractalFrame) },
-    };
+    }, .{
+        .binding = 1,
+        .visibility = .{ .fragment = true },
+        .texture = .{ .sample_type = .float, .view_dimension = .tvdim_2d },
+    } };
     const bind_group_layout_desc: wgpu.BindGroupLayoutDescriptor = .{
-        .entry_count = 1,
+        .entry_count = binding_layout.len,
         .entries = @ptrCast(&binding_layout),
     };
     const bind_group_layout = gctx.device.createBindGroupLayout(bind_group_layout_desc);
 
-    const binding: wgpu.BindGroupEntry = .{
+    const bindings: [2]wgpu.BindGroupEntry = .{ .{
         .binding = 0,
         .buffer = uniform_buffer,
         .offset = 0,
         .size = @sizeOf(FractalFrame),
-    };
+    }, .{
+        .binding = 1,
+        .texture_view = texture_view,
+        .size = 0,
+    } };
+
     const bind_group_desc: wgpu.BindGroupDescriptor = .{
         .layout = bind_group_layout,
-        .entry_count = 1,
-        .entries = @ptrCast(&binding),
+        .entry_count = bindings.len,
+        .entries = @ptrCast(&bindings),
     };
     const bind_group = gctx.device.createBindGroup(bind_group_desc);
 
     return .{
-        .uniform_buffer = uniform_buffer,
         .bind_group_layout = bind_group_layout,
         .bind_group = bind_group,
     };
