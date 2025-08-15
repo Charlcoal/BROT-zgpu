@@ -5,7 +5,6 @@ struct FracFrame {
 }
 
 @group(0) @binding(0) var<uniform> frame: FracFrame;
-@group(0) @binding(1) var gradientTexture: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) vec4f {
@@ -15,11 +14,6 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) ve
     );
     var p = verts[in_vertex_index];
     return vec4f(p, 0.0, 1.0);
-}
-
-@fragment
-fn texture_passthrough(@builtin(position) screen_pos: vec4f) -> @location(0) vec4f {
-    return vec4f(textureLoad(gradientTexture, vec2i(screen_pos.x, screen_pos.y), 0).rgb, 255.0);
 }
 
 @fragment
